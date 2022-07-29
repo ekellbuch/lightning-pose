@@ -56,7 +56,7 @@ training:
   # number of gpus to train a single model
   num_gpus: 1
   # number of cpu workers for data loaders
-  num_workers: 8 # assuming p3.2xlarge
+  num_workers: 4
   # epochs over which to assess validation metrics for early stopping
   early_stop_patience: 3
   # epoch at which backbone network weights begin updating
@@ -99,8 +99,9 @@ model:
   losses_to_use: []
   # whether to learn the weights for the unsupervised losses
   learn_weights: false
-  # resnet version for backbone - 18 | 34 | 50 | 101 | 152
-  # resnet_version
+  # resnet18 | resnet34 | resnet50 | resnet101 | resnet152 | resnet50_contrastive
+  # resnet50_3d
+  # efficientnet_b0 | efficientnet_b1 | efficientnet_b2
   backbone: resnet50
   # prediction mode - "heatmap" | "regression"
   model_type: "heatmap"
@@ -108,7 +109,7 @@ model:
   # "mse" | "wasserstein"
   heatmap_loss_type: "mse"
   # tt expt name
-  model_name: "hparam-search_07-22"
+  model_name: "biorxiv22a"
   # do context (5 frames)
   do_context: false
 
@@ -129,18 +130,18 @@ dali:
 
   context: # not supporting context_sequences_successive
     train: # defaults: sequence_length=5, step=sequence_length
-      batch_size: 4 # 12 times 5 = 60
-      random_shuffle: true # can select False if want successive sequences to be presented to network
+      batch_size: 8
+      consecutive_sequences: true # can select False if want successive sequences to be presented to network
 
     predict: # defaults: sequence_length=5, step=1
       # (train_batch_size / 4 + context.train.batch_size) * 2 -> round down to nearest pow of 2
-      batch_size: 16
+      batch_size: 12
 
 losses:
   # loss = projection onto the discarded eigenvectors
   pca_multiview:
     # weight in front of PCA loss
-    log_weight: 7.0
+    log_weight: 5.0
     # predictions whould lie within the low-d subspace spanned by these components
     components_to_keep: 3
     # percentile of reprojection errors on train data below which pca loss is zeroed out
@@ -154,7 +155,7 @@ losses:
   # loss = projection onto the discarded eigenvectors
   pca_singleview:
     # weight in front of PCA loss
-    log_weight: 8.0
+    log_weight: 5.0
     # predictions whould lie within the low-d subspace spanned by components that describe this fraction of variance
     components_to_keep: 0.99
     # percentile of reprojection errors on train data below which pca loss is zeroed out
@@ -168,16 +169,16 @@ losses:
   # loss = norm of distance between successive timepoints
   temporal:
     # weight in front of temporal loss
-    log_weight: 7.0
+    log_weight: 5.0
     # for epsilon insensitive rectification
     # (in pixels; diffs below this are not penalized)
-    epsilon: 20.0
+    epsilon: 10.0
 
 eval:
   # paths to the hydra config files in the output folder, OR absolute paths to such folders.
   hydra_paths: [" "]
   # predict?
-  predict_vids_after_training: false
+  predict_vids_after_training: true
   # save .mp4?
   save_vids_after_training: false
   fiftyone:
@@ -199,7 +200,7 @@ eval:
   # (it's not absolute just for the toy example)
   test_videos_directory: "/datastores/mirror-fish/videos_new"
   # str with an absolute path to directory in which you want to save .csv with predictions
-  saved_vid_preds_dir: null
+  saved_vid_preds_dir: "/home/jovyan"
   # create labeled video from each video in test_videos_directory
   create_labeled_video: false
   # confidence threshold for plotting a vid
