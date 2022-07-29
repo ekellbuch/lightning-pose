@@ -234,6 +234,9 @@ def get_data_module(
             val_probability=cfg.training.val_prob,
             train_frames=cfg.training.train_frames,
             torch_seed=cfg.training.rng_seed_data_pt,
+            use_deterministic_split=cfg.training.get('use_deterministic_split', False),
+            deterministic_split=cfg.training.get('deterministic_split', None),
+
         )
     else:
         if not (cfg.training.gpu_id, int):

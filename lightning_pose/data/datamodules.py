@@ -5,7 +5,7 @@ import os
 from omegaconf import DictConfig
 import pytorch_lightning as pl
 import torch
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, Subset
 from typeguard import typechecked
 from typing import Dict, List, Literal, Optional, Tuple, Union
 
@@ -35,12 +35,15 @@ class BaseDataModule(pl.LightningDataModule):
         test_probability: Optional[float] = None,
         train_frames: Optional[Union[float, int]] = None,
         torch_seed: int = 42,
+        use_deterministic_split: bool = False,
+        deterministic_split: Optional[List] = None,
     ) -> None:
         """Data module splits a dataset into train, val, and test data loaders.
 
         Args:
             dataset: base dataset to be split into train/val/test
             use_deterministic: TODO: use deterministic split of data...?
+            use_deterministic_split: use split of data for train/val/test
             train_batch_size: number of samples of training batches
             val_batch_size: number of samples in validation batches
             test_batch_size: number of samples in test batches
@@ -65,6 +68,7 @@ class BaseDataModule(pl.LightningDataModule):
         # maybe can make the view information more general when deciding on a
         # specific format for csv files
         self.use_deterministic = use_deterministic
+        self.use_deterministic_split = use_deterministic_split
         # info about dataset splits
         self.train_probability = train_probability
         self.val_probability = val_probability
@@ -74,10 +78,21 @@ class BaseDataModule(pl.LightningDataModule):
         self.val_dataset = None  # populated by self.setup()
         self.test_dataset = None  # populated by self.setup()
         self.torch_seed = torch_seed
+        self.deterministic_split = deterministic_split
 
     def setup(self, stage: Optional[str] = None):  # stage arg needed for ptl
 
         if self.use_deterministic:
+            return
+
+        # Use deterministic/explicit split of data
+        if self.use_deterministic_split:
+            train_frames = self.deterministic_split[0]
+            val_frames = self.deterministic_split[1]
+            test_frames = self.deterministic_split[2]
+            self.train_dataset = Subset(self.dataset, train_frames)
+            self.val_dataset = Subset(self.dataset, val_frames)
+            self.test_dataset = Subset(self.dataset, test_frames)
             return
 
         datalen = self.dataset.__len__()

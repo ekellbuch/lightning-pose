@@ -46,7 +46,6 @@ from typing import List, Tuple
 from torchtyping import TensorType, patch_typeguard
 from lightning_pose.utils.predictions_new import PredictionHandler
 
-
 _TORCH_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -90,7 +89,12 @@ def train(cfg: DictConfig):
     # Set up and run training
     # ----------------------------------------------------------------------------------
 
-    logger = pl.loggers.TensorBoardLogger("tb_logs", name=cfg.model.model_name)
+    # wandb setup
+    if cfg.wandb.logger:
+        logger = pl.loggers.WandbLogger(save_dir="tb_logs", name=cfg.model.model_name, **cfg.wandb.params)
+    else:
+        logger = pl.loggers.TensorBoardLogger("tb_logs", name=cfg.model.model_name)
+
     early_stopping = pl.callbacks.EarlyStopping(
         monitor="val_supervised_loss",
         patience=cfg.training.early_stop_patience,
@@ -181,7 +185,7 @@ def train(cfg: DictConfig):
         raise FileNotFoundError(
             "Cannot find model checkpoint. Have you trained for too few epochs?"
         )
-    
+
     # ----------------------------------------------------------------------------------
     # predict full dataloader
     # ----------------------------------------------------------------------------------
