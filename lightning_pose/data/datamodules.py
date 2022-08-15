@@ -77,6 +77,7 @@ class BaseDataModule(pl.LightningDataModule):
         self.train_dataset = None  # populated by self.setup()
         self.val_dataset = None  # populated by self.setup()
         self.test_dataset = None  # populated by self.setup()
+        self.al_dataset = None  # populated by self.setup()
         self.torch_seed = torch_seed
         self.deterministic_split = deterministic_split
 
@@ -90,9 +91,12 @@ class BaseDataModule(pl.LightningDataModule):
             train_frames = self.deterministic_split[0]
             val_frames = self.deterministic_split[1]
             test_frames = self.deterministic_split[2]
+            al_frames = self.deterministic_split[3]
+
             self.train_dataset = Subset(self.dataset, train_frames)
             self.val_dataset = Subset(self.dataset, val_frames)
             self.test_dataset = Subset(self.dataset, test_frames)
+            self.al_dataset = Subset(self.dataset, al_frames)
             return
 
         datalen = self.dataset.__len__()
@@ -101,7 +105,6 @@ class BaseDataModule(pl.LightningDataModule):
                 datalen
             )
         )
-
         # split data based on provided probabilities
         data_splits_list = split_sizes_from_probabilities(
             datalen,
@@ -125,8 +128,9 @@ class BaseDataModule(pl.LightningDataModule):
             if n_frames < len(self.train_dataset):
                 # split the data a second time to reflect further subsampling from
                 # train_frames
+                # use frames not used for active learning.
+                self.al_dataset = Subset(self.dataset, self.train_dataset.indices[n_frames:])
                 self.train_dataset.indices = self.train_dataset.indices[:n_frames]
-
         print(
             "Size of -- train set: {}, val set: {}, test set: {}".format(
                 len(self.train_dataset), len(self.val_dataset), len(self.test_dataset)
@@ -168,6 +172,13 @@ class BaseDataModule(pl.LightningDataModule):
             shuffle=False,
         )
 
+    def al_dataloader(self) -> torch.utils.data.DataLoader:
+        return DataLoader(
+            self.al_dataset,
+            batch_size=self.train_batch_size,
+            num_workers=self.num_workers,
+            shuffle=False,
+        )
 
 class UnlabeledDataModule(BaseDataModule):
     """Data module that contains labeled and unlabled data loaders."""
