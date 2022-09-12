@@ -27,19 +27,6 @@ from lightning_pose.utils.scripts import (
     get_loss_factories,
     get_model,
 )
-from lightning_pose.data.dali import (
-    PrepareDALI,
-    video_pipe,
-    LightningWrapper,
-    ContextLightningWrapper,
-)
-
-from nvidia.dali.plugin.pytorch import LastBatchPolicy
-from typing import List, Tuple
-from torchtyping import TensorType, patch_typeguard
-from lightning_pose.utils.predictions_new import PredictionHandler
-
-_TORCH_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 @hydra.main(config_path="configs", config_name="config")
@@ -82,16 +69,13 @@ def train(cfg: DictConfig):
     # Set up and run training
     # ----------------------------------------------------------------------------------
 
-    # logger
-    logger = pl.loggers.TensorBoardLogger("tb_logs", name=cfg.model.model_name)
-
-    # callbacks
     # wandb setup
     if cfg.wandb.logger:
         logger = pl.loggers.WandbLogger(save_dir="tb_logs", name=cfg.model.model_name, **cfg.wandb.params)
     else:
         logger = pl.loggers.TensorBoardLogger("tb_logs", name=cfg.model.model_name)
 
+    # callbacks
     early_stopping = pl.callbacks.EarlyStopping(
         monitor="val_supervised_loss",
         patience=cfg.training.early_stop_patience,
@@ -186,7 +170,6 @@ def train(cfg: DictConfig):
         data_module_pred.setup()
     else:
         data_module_pred = data_module
-
 
     # ----------------------------------------------------------------------------------
     # predict on all labeled frames (train/val/test)
