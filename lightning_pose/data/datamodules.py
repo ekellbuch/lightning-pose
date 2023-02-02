@@ -6,25 +6,27 @@ from omegaconf import DictConfig
 import pytorch_lightning as pl
 import torch
 from torch.utils.data import DataLoader, random_split, Subset
+from torchtyping import patch_typeguard
 from typeguard import typechecked
-from typing import Dict, List, Literal, Optional, Tuple, Union
+from typing import Dict, List, Literal, Optional, Tuple, Union, TypedDict
 
 from lightning_pose.data.dali import PrepareDALI, LitDaliWrapper
-from lightning_pose.data.utils import split_sizes_from_probabilities, compute_num_train_frames
+from lightning_pose.data.utils import (
+    split_sizes_from_probabilities, compute_num_train_frames, SemiSupervisedDataLoaderDict)
 from lightning_pose.utils.io import check_video_paths
 
 _TORCH_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# TODO: add typechecks here
+patch_typeguard()  # use before @typechecked
 
 
+@typechecked
 class BaseDataModule(pl.LightningDataModule):
     """Splits a labeled dataset into train, val, and test data loaders."""
 
     def __init__(
         self,
         dataset: torch.utils.data.Dataset,
-        use_deterministic: bool = False,
         train_batch_size: int = 16,
         val_batch_size: int = 16,
         test_batch_size: int = 1,
@@ -135,10 +137,6 @@ class BaseDataModule(pl.LightningDataModule):
                 len(self.train_dataset), len(self.val_dataset), len(self.test_dataset)
             )
         )
-    
-    def setup_video_prediction(self, video: str):
-        """ this will depend on context flag in dataset"""
-        pass
 
     def train_dataloader(self) -> torch.utils.data.DataLoader:
         return DataLoader(
@@ -187,7 +185,6 @@ class UnlabeledDataModule(BaseDataModule):
         dataset: torch.utils.data.Dataset,
         video_paths_list: Union[List[str], str],
         dali_config: Union[dict, DictConfig],
-        use_deterministic: bool = False,
         train_batch_size: int = 16,
         val_batch_size: int = 16,
         test_batch_size: int = 1,
@@ -197,13 +194,13 @@ class UnlabeledDataModule(BaseDataModule):
         test_probability: Optional[float] = None,
         train_frames: Optional[float] = None,
         torch_seed: int = 42,
+        imgaug: Literal["default", "dlc", "dlc-light"] = "default",
     ) -> None:
         """Data module that contains labeled and unlabeled data loaders.
 
         Args:
             dataset: pytorch Dataset for labeled data
             video_paths_list: absolute paths of videos ("unlabeled" data)
-            use_deterministic: TODO: use deterministic split of data...?
             train_batch_size: number of samples of training batches
             val_batch_size: number of samples in validation batches
             test_batch_size: number of samples in test batches
@@ -218,11 +215,11 @@ class UnlabeledDataModule(BaseDataModule):
                 train frames
             torch_seed: control data splits
             torch_seed: control randomness of labeled data loading
+            imgaug: type of image augmentation to apply to unlabeled frames
 
         """
         super().__init__(
             dataset=dataset,
-            use_deterministic=use_deterministic,
             train_batch_size=train_batch_size,
             val_batch_size=val_batch_size,
             test_batch_size=test_batch_size,
@@ -239,39 +236,31 @@ class UnlabeledDataModule(BaseDataModule):
         self.num_workers_for_labeled = num_workers // 2
         self.dali_config = dali_config
         self.unlabeled_dataloader = None  # initialized in setup_unlabeled
+        self.imgaug = imgaug
         super().setup()
         self.setup_unlabeled()
 
     def setup_unlabeled(self):
         """Sets up the unlabeled data loader."""
-        # dali prep
-        # TODO: currently not controlling context_frames_successive. internally it is
-        # set to False.
         dali_prep = PrepareDALI(
             train_stage="train",
             model_type="context" if self.dataset.do_context else "base",
             filenames=self.filenames,
             resize_dims=[self.dataset.height, self.dataset.width],
-            dali_config=self.dali_config)
+            dali_config=self.dali_config,
+            imgaug=self.imgaug,
+        )
 
         self.unlabeled_dataloader = dali_prep()
 
-    def train_dataloader(self):
-        loader = {
-            "labeled": DataLoader(
+    def train_dataloader(self) -> SemiSupervisedDataLoaderDict:
+        loader = SemiSupervisedDataLoaderDict(
+            labeled=DataLoader(
                 self.train_dataset,
                 batch_size=self.train_batch_size,
                 num_workers=self.num_workers_for_labeled,
                 persistent_workers=True,
             ),
-            "unlabeled": self.unlabeled_dataloader,
-        }
-        return loader
-
-    # TODO: check if necessary
-    def predict_dataloader(self):
-        return DataLoader(
-            self.test_dataset,
-            batch_size=self.test_batch_size,
-            num_workers=self.num_workers_for_labeled,
+            unlabeled=self.unlabeled_dataloader,
         )
+        return loader

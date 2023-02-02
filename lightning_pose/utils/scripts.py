@@ -5,6 +5,7 @@ from moviepy.editor import VideoFileClip
 import numpy as np
 from omegaconf import DictConfig, OmegaConf
 import os
+import pandas as pd
 import pytorch_lightning as pl
 from typeguard import typechecked
 from typing import Dict, Optional, Union
@@ -13,16 +14,28 @@ from lightning_pose.data.dali import PrepareDALI
 from lightning_pose.data.datamodules import BaseDataModule, UnlabeledDataModule
 from lightning_pose.data.datasets import BaseTrackingDataset, HeatmapDataset
 from lightning_pose.losses.factory import LossFactory
-from lightning_pose.models.heatmap_tracker import (
-    HeatmapTracker,
-    SemiSupervisedHeatmapTracker,
+from lightning_pose.metrics import (
+    pixel_error,
+    temporal_norm,
+    pca_singleview_reprojection_error,
+    pca_multiview_reprojection_error,
 )
 from lightning_pose.models.regression_tracker import (
     RegressionTracker,
     SemiSupervisedRegressionTracker,
 )
+from lightning_pose.models.heatmap_tracker import (
+    HeatmapTracker,
+    SemiSupervisedHeatmapTracker,
+)
+from lightning_pose.models.heatmap_tracker_mhcrnn import (
+    HeatmapTrackerMHCRNN,
+    SemiSupervisedHeatmapTrackerMHCRNN,
+)
 from lightning_pose.utils import get_gpu_list_from_cfg, pretty_print_str
-from lightning_pose.utils.io import check_if_semi_supervised, return_absolute_data_paths
+from lightning_pose.utils.io import return_absolute_path, return_absolute_data_paths
+from lightning_pose.utils.io import check_if_semi_supervised, get_keypoint_names
+from lightning_pose.utils.pca import KeypointPCA
 from lightning_pose.utils.predictions import load_model_from_checkpoint, create_labeled_video, \
     PredictionHandler, predict_single_video
 
@@ -184,22 +197,20 @@ def get_dataset(
             imgaug_transform=imgaug_transform,
             do_context=cfg.model.do_context,
         )
-    elif cfg.model.model_type == "heatmap":
+    elif cfg.model.model_type == "heatmap" or cfg.model.model_type == "heatmap_mhcrnn":
         dataset = HeatmapDataset(
             root_directory=data_dir,
             csv_path=cfg.data.csv_file,
             header_rows=OmegaConf.to_object(cfg.data.header_rows),
             imgaug_transform=imgaug_transform,
             downsample_factor=cfg.data.downsample_factor,
-            do_context=cfg.model.do_context,
+            do_context=cfg.model.model_type == "heatmap_mhcrnn" or cfg.model.do_context,
         )
     else:
         raise NotImplementedError(
             "%s is an invalid cfg.model.model_type" % cfg.model.model_type
         )
-    image = Image.open(
-        os.path.join(dataset.root_directory, dataset.image_names[0])
-    ).convert("RGB")
+    image = Image.open(os.path.join(dataset.root_directory, dataset.image_names[0])).convert("RGB")
     if image.size != (
         cfg.data.image_orig_dims.width,
         cfg.data.image_orig_dims.height,
@@ -263,6 +274,7 @@ def get_data_module(
             train_frames=cfg.training.train_frames,
             dali_config=cfg.dali,
             torch_seed=cfg.training.rng_seed_data_pt,
+            imgaug=cfg.training.get("imgaug", "default"),
         )
     return data_module
 
@@ -279,10 +291,9 @@ def get_loss_factories(
 
     # collect all supervised losses in a dict; no extra params needed
     # set "log_weight = 0.0" so that weight = 1 and effective weight is (1 / 2)
-    if cfg.model.model_type == "heatmap":
-        loss_params_dict["supervised"]["heatmap_" + cfg.model.heatmap_loss_type] = {
-            "log_weight": 0.0
-        }
+    if cfg.model.model_type == "heatmap" or cfg.model.model_type == "heatmap_mhcrnn":
+        loss_name = "heatmap_" + cfg.model.heatmap_loss_type
+        loss_params_dict["supervised"][loss_name] = {"log_weight": 0.0}
     else:
         loss_params_dict["supervised"][cfg.model.model_type] = {"log_weight": 0.0}
 
@@ -293,7 +304,7 @@ def get_loss_factories(
             loss_params_dict["unsupervised"][loss_name] = cfg_loss_dict[loss_name]
             loss_params_dict["unsupervised"][loss_name]["loss_name"] = loss_name
             # loss-specific parameters
-            if loss_name[:8] == "unimodal":
+            if loss_name[:8] == "unimodal" or loss_name[:15] == "temporal_heatmap":
                 if cfg.model.model_type == "regression":
                     raise NotImplementedError(
                         f"unimodal loss can only be used with classes inheriting from "
@@ -346,12 +357,7 @@ def get_model(
     cfg: DictConfig,
     data_module: Union[BaseDataModule, UnlabeledDataModule],
     loss_factories: Dict[str, LossFactory],
-) -> Union[
-    RegressionTracker,
-    HeatmapTracker,
-    SemiSupervisedRegressionTracker,
-    SemiSupervisedHeatmapTracker,
-]:
+) -> pl.LightningModule:
     """Create model: regression or heatmap based, supervised or semi-supervised."""
 
     lr_scheduler = cfg.training["lr_scheduler"]
@@ -379,6 +385,17 @@ def get_model(
                 lr_scheduler=lr_scheduler,
                 lr_scheduler_params=lr_scheduler_params,
                 do_context=cfg.model.do_context,
+            )
+        elif cfg.model.model_type == "heatmap_mhcrnn":
+            model = HeatmapTrackerMHCRNN(
+                num_keypoints=cfg.data.num_keypoints,
+                loss_factory=loss_factories["supervised"],
+                backbone=cfg.model.backbone,
+                downsample_factor=cfg.data.downsample_factor,
+                output_shape=data_module.dataset.output_shape,
+                torch_seed=cfg.training.rng_seed_model_pt,
+                lr_scheduler=lr_scheduler,
+                lr_scheduler_params=lr_scheduler_params,
             )
         else:
             raise NotImplementedError(
@@ -414,12 +431,134 @@ def get_model(
                 lr_scheduler_params=lr_scheduler_params,
                 do_context=cfg.model.do_context,
             )
+        elif cfg.model.model_type == "heatmap_mhcrnn":
+            model = SemiSupervisedHeatmapTrackerMHCRNN(
+                num_keypoints=cfg.data.num_keypoints,
+                loss_factory=loss_factories["supervised"],
+                loss_factory_unsupervised=loss_factories["unsupervised"],
+                backbone=cfg.model.backbone,
+                downsample_factor=cfg.data.downsample_factor,
+                output_shape=data_module.dataset.output_shape,
+                torch_seed=cfg.training.rng_seed_model_pt,
+                lr_scheduler=lr_scheduler,
+                lr_scheduler_params=lr_scheduler_params,
+            )
         else:
             raise NotImplementedError(
                 "%s is an invalid cfg.model.model_type for a semi-supervised model"
                 % cfg.model.model_type
             )
     return model
+
+
+@typechecked
+def compute_metrics(
+    cfg: DictConfig,
+    preds_file: str,
+    data_module: Optional[Union[BaseDataModule, UnlabeledDataModule]] = None,
+) -> None:
+    """Compute various metrics on predictions csv file."""
+
+    # get keypoint names
+    labels_file = return_absolute_path(
+        os.path.join(cfg["data"]["data_dir"], cfg["data"]["csv_file"]))
+    labels_df = pd.read_csv(labels_file, header=list(cfg["data"]["header_rows"]), index_col=0)
+    keypoint_names = get_keypoint_names(
+        cfg, csv_file=labels_file, header_rows=list(cfg["data"]["header_rows"]))
+
+    # load predictions
+    pred_df = pd.read_csv(preds_file, header=[0, 1, 2], index_col=0)
+    if pred_df.keys()[-1][0] == "set":
+        # these are predictions on labeled data
+        # get rid of last column that contains info about train/val/test set
+        is_video = False
+        tmp = pred_df.iloc[:, :-1].to_numpy().reshape(pred_df.shape[0], -1, 3)
+        index = labels_df.index
+        set = pred_df.iloc[:, -1].to_numpy()
+    else:
+        # these are predictions on video data
+        is_video = True
+        tmp = pred_df.to_numpy().reshape(pred_df.shape[0], -1, 3)
+        index = pred_df.index
+        set = None
+
+    keypoints_pred = tmp[:, :, :2]  # shape (samples, n_keypoints, 2)
+    # confidences = tmp[:, :, -1]  # shape (samples, n_keypoints)
+
+    # hard-code metrics for now
+    if is_video:
+        metrics_to_compute = ["temporal"]
+    else:  # labeled data
+        metrics_to_compute = ["pixel_error"]
+    # for either labeled and unlabeled data, if a pca loss is specified in config, we compute the
+    # associated metric
+    if cfg.data.get("columns_for_singleview_pca", None) is not None \
+            and len(cfg.data.columns_for_singleview_pca) != 0:
+        metrics_to_compute += ["pca_singleview"]
+    if cfg.data.get("mirrored_column_matches", None) is not None \
+            and len(cfg.data.mirrored_column_matches) != 0:
+        metrics_to_compute += ["pca_multiview"]
+
+    # compute metrics; csv files will be saved to the same directory the prdictions are stored in
+    if "pixel_error" in metrics_to_compute:
+        keypoints_true = labels_df.to_numpy().reshape(labels_df.shape[0], -1, 2)
+        error_per_keypoint = pixel_error(keypoints_true, keypoints_pred)
+        error_df = pd.DataFrame(error_per_keypoint, index=index, columns=keypoint_names)
+        # add train/val/test split
+        if set is not None:
+            error_df["set"] = set
+        save_file = preds_file.replace(".csv", "_pixel_error.csv")
+        error_df.to_csv(save_file)
+
+    if "temporal" in metrics_to_compute:
+        temporal_norm_per_keypoint = temporal_norm(keypoints_pred)
+        temporal_norm_df = pd.DataFrame(
+            temporal_norm_per_keypoint, index=index, columns=keypoint_names)
+        # add train/val/test split
+        if set is not None:
+            temporal_norm_df["set"] = set
+        save_file = preds_file.replace(".csv", "_temporal_norm.csv")
+        temporal_norm_df.to_csv(save_file)
+
+    if "pca_singleview" in metrics_to_compute:
+        # build pca object
+        pca = KeypointPCA(
+            loss_type="pca_singleview",
+            data_module=data_module,
+            components_to_keep=cfg.losses.pca_singleview.components_to_keep,
+            empirical_epsilon_percentile=cfg.losses.pca_singleview.empirical_epsilon_percentile,
+            columns_for_singleview_pca=cfg.data.columns_for_singleview_pca,
+        )
+        # re-fit pca on the labeled data to get params
+        pca()
+        # compute reprojection error
+        pcasv_error_per_keypoint = pca_singleview_reprojection_error(keypoints_pred, pca, cfg)
+        pcasv_df = pd.DataFrame(pcasv_error_per_keypoint, index=index, columns=keypoint_names)
+        # add train/val/test split
+        if set is not None:
+            pcasv_df["set"] = set
+        save_file = preds_file.replace(".csv", "_pca_singleview_error.csv")
+        pcasv_df.to_csv(save_file)
+
+    if "pca_multiview" in metrics_to_compute:
+        # build pca object
+        pca = KeypointPCA(
+            loss_type="pca_multiview",
+            data_module=data_module,
+            components_to_keep=cfg.losses.pca_singleview.components_to_keep,
+            empirical_epsilon_percentile=cfg.losses.pca_singleview.empirical_epsilon_percentile,
+            mirrored_column_matches=cfg.data.mirrored_column_matches,
+        )
+        # re-fit pca on the labeled data to get params
+        pca()
+        # compute reprojection error
+        pcamv_error_per_keypoint = pca_multiview_reprojection_error(keypoints_pred, pca, cfg)
+        pcamv_df = pd.DataFrame(pcamv_error_per_keypoint, index=index, columns=keypoint_names)
+        # add train/val/test split
+        if set is not None:
+            pcamv_df["set"] = set
+        save_file = preds_file.replace(".csv", "_pca_multiview_error.csv")
+        pcamv_df.to_csv(save_file)
 
 
 @typechecked
@@ -432,11 +571,15 @@ def export_predictions_and_labeled_video(
     model: Optional[Union[
         RegressionTracker,
         HeatmapTracker,
+        HeatmapTrackerMHCRNN,
         SemiSupervisedRegressionTracker,
         SemiSupervisedHeatmapTracker,
+        SemiSupervisedHeatmapTrackerMHCRNN,
     ]] = None,
     data_module: Optional[Union[BaseDataModule, UnlabeledDataModule]] = None,
+    gpu_id: Optional[int] = None,
     labeled_mp4_file: Optional[str] = None,
+    save_heatmaps: Optional[bool] = False,
 ) -> None:
     """Export predictions csv and a labeled video for a single video file."""
 
@@ -446,9 +589,11 @@ def export_predictions_and_labeled_video(
         ckpt_file=ckpt_file,
         cfg_file=cfg,
         preds_file=prediction_csv_file,
+        gpu_id=gpu_id,
         trainer=trainer,
         model=model,
         data_module=data_module,
+        save_heatmaps=save_heatmaps,
     )
 
     # create labeled video

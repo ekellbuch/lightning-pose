@@ -26,10 +26,11 @@ from lightning_pose.utils.scripts import (
     get_imgaug_transform,
     get_loss_factories,
     get_model,
+    compute_metrics,
 )
 
 
-@hydra.main(config_path="configs", config_name="config")
+@hydra.main(config_path="configs", config_name="config_toy-dataset")
 def train(cfg: DictConfig):
     """Main fitting function, accessed from command line."""
 
@@ -86,7 +87,7 @@ def train(cfg: DictConfig):
     transfer_unfreeze_callback = pl.callbacks.BackboneFinetuning(
         unfreeze_backbone_at_epoch=cfg.training.unfreezing_epoch,
         lambda_func=lambda epoch: 1.5,
-        backbone_initial_ratio_lr=   0.1,
+        backbone_initial_ratio_lr=0.1,
         should_align=True,
         train_bn=True,
     )
@@ -175,9 +176,16 @@ def train(cfg: DictConfig):
     # predict on all labeled frames (train/val/test)
     # ----------------------------------------------------------------------------------
     pretty_print_str("Predicting train/val/test images...")
+    # compute and save frame-wise predictions
+    preds_file = os.path.join(hydra_output_directory, "predictions.csv")
     predict_dataset(
         cfg=cfg, trainer=trainer, model=model, data_module=data_module_pred, ckpt_file=best_ckpt,
-        preds_file=os.path.join(hydra_output_directory, "predictions.csv"))
+        preds_file=preds_file)
+    # compute and save various metrics
+    try:
+        compute_metrics(cfg=cfg, preds_file=preds_file, data_module=data_module_pred)
+    except:
+        pass
 
     # ----------------------------------------------------------------------------------
     # predict folder of videos
@@ -213,8 +221,47 @@ def train(cfg: DictConfig):
                 labeled_mp4_file=labeled_mp4_file,
                 trainer=trainer,
                 model=model,
+                gpu_id=cfg.training.gpu_id,
                 data_module=data_module_pred,
+                save_heatmaps=cfg.eval.get("predict_vids_after_training_save_heatmaps", False),
             )
+            # compute and save various metrics
+            try:
+                compute_metrics(
+                    cfg=cfg, preds_file=prediction_csv_file, data_module=data_module_pred)
+            except:
+                continue
+
+    # ----------------------------------------------------------------------------------
+    # predict on OOD frames
+    # ----------------------------------------------------------------------------------
+    # update config file to point to OOD data
+    csv_file_ood = os.path.join(cfg.data.data_dir, cfg.data.csv_file).replace(".csv", "_new.csv")
+    if os.path.exists(csv_file_ood):
+        cfg_ood = cfg.copy()
+        cfg_ood.data.csv_file = csv_file_ood
+        cfg_ood.training.imgaug = "default"
+        cfg_ood.training.train_prob = 1
+        cfg_ood.training.val_prob = 0
+        cfg_ood.training.train_frames = 1
+        # build dataset/datamodule
+        imgaug_transform_ood = get_imgaug_transform(cfg=cfg_ood)
+        dataset_ood = get_dataset(
+            cfg=cfg_ood, data_dir=data_dir, imgaug_transform=imgaug_transform_ood)
+        data_module_ood = get_data_module(
+            cfg=cfg_ood, dataset=dataset_ood, video_dir=video_dir)
+        data_module_ood.setup()
+        pretty_print_str("Predicting OOD images...")
+        # compute and save frame-wise predictions
+        preds_file_ood = os.path.join(hydra_output_directory, "predictions_new.csv")
+        predict_dataset(
+            cfg=cfg_ood, trainer=trainer, model=model, data_module=data_module_ood,
+            ckpt_file=best_ckpt, preds_file=preds_file_ood)
+        # compute and save various metrics
+        try:
+            compute_metrics(cfg=cfg_ood, preds_file=preds_file_ood, data_module=data_module_ood)
+        except:
+            pass
 
 
 def pretty_print(cfg):
